@@ -330,7 +330,10 @@ export default function CartDrawer({
       // 1. Submit order to backend server
       const response = await fetch('/api/orders', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': user?.token ? `Bearer ${user.token}` : ''
+        },
         body: JSON.stringify({
           userId: user.id,
           username: deliveryName.trim(),

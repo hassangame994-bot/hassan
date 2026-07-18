@@ -318,7 +318,7 @@ async function saveToDiskAsync() {
   lastWriteTime = Date.now();
 
   try {
-    const tempFile = DB_FILE + '.tmp';
+    const tempFile = DB_FILE + '.tmp.' + crypto.randomBytes(6).toString('hex');
     const dataStr = JSON.stringify(dbCache); // Remove nested pretty-print formatting for maximum speed & disk space saving
     await fs.promises.writeFile(tempFile, dataStr, 'utf-8');
     await fs.promises.rename(tempFile, DB_FILE);
@@ -335,7 +335,7 @@ async function saveToDiskAsync() {
 function saveToDiskSync() {
   try {
     const dataStr = JSON.stringify(dbCache);
-    const tempFile = DB_FILE + '.tmp';
+    const tempFile = DB_FILE + '.tmp.' + crypto.randomBytes(6).toString('hex');
     fs.writeFileSync(tempFile, dataStr, 'utf-8');
     fs.renameSync(tempFile, DB_FILE);
   } catch (err) {
@@ -352,22 +352,40 @@ function saveToDisk() {
 // ==========================================
 let MONGODB_URI = process.env.MONGODB_URI;
 
-// 30-Year Veteran Resilience Fallback: If MONGODB_URI is not in process.env, 
-// automatically look for a raw MongoDB connection string inside the .env file.
+// 30-Year Veteran Resilience Fallback: Multi-path env scanner that resolves MongoDB connection strings
+// from root and subdirectories (including data/ folder as seen in VS Code screenshot)
 if (!MONGODB_URI) {
-  try {
-    const envPath = path.join(process.cwd(), '.env');
-    if (fs.existsSync(envPath)) {
-      const envContent = fs.readFileSync(envPath, 'utf8');
-      // Look for standard or SRV MongoDB URIs even if the user didn't write "MONGODB_URI="
-      const match = envContent.match(/(mongodb(?:\+srv)?:\/\/[^\s"'`]+)/);
-      if (match) {
-        MONGODB_URI = match[1].trim();
-        console.log('💡 [30-Yr Veteran Fallback] Found MongoDB connection string in .env without standard variable prefix. Using it automatically!');
+  const envLocations = [
+    path.join(process.cwd(), '.env'),
+    path.join(process.cwd(), 'data', '.env'),
+    path.join(__dirname, '.env'),
+    path.join(__dirname, 'data', '.env')
+  ];
+
+  for (const envPath of envLocations) {
+    try {
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        
+        // 1. Check for standard MONGODB_URI=... assignment
+        const matchKeyVal = envContent.match(/MONGODB_URI\s*=\s*["'`]?([^\s"'`]+)["'`]?/i);
+        if (matchKeyVal && matchKeyVal[1]) {
+          MONGODB_URI = matchKeyVal[1].trim();
+          console.log(`💡 [30-Yr Veteran Fallback] Successfully parsed MONGODB_URI from: ${envPath}`);
+          break;
+        }
+
+        // 2. Fallback to extracting any raw standard or SRV MongoDB URIs even if they did not define a key
+        const matchRaw = envContent.match(/(mongodb(?:\+srv)?:\/\/[^\s"'`]+)/);
+        if (matchRaw && matchRaw[1]) {
+          MONGODB_URI = matchRaw[1].trim();
+          console.log(`💡 [30-Yr Veteran Fallback] Successfully extracted raw MongoDB connection string from: ${envPath}`);
+          break;
+        }
       }
+    } catch (e) {
+      // Ignore filesystem read exceptions for non-existent/inaccessible paths
     }
-  } catch (e) {
-    // Ignore read errors
   }
 }
 
@@ -980,12 +998,13 @@ export async function reconcileDatabases() {
     try {
       const deletedUserIds = dbCache.deletedUserIds || [];
 
-      // First, purge any pending deleted users from MongoDB
+      // First, purge any pending deleted users from MongoDB using resilient queries
       if (deletedUserIds.length > 0) {
         console.log(`🧹 [Reconciliation] Purging ${deletedUserIds.length} pending deleted users from MongoDB:`, deletedUserIds);
         for (const delId of deletedUserIds) {
           try {
-            await UserModel.deleteOne({ id: delId });
+            await UserModel.deleteMany(getResilientQuery(delId));
+            await UserModel.collection.deleteMany({ id: delId });
           } catch (e) {
             console.error(`❌ [Reconciliation] Failed to delete user ${delId} from MongoDB during sync:`, e);
           }
@@ -993,61 +1012,53 @@ export async function reconcileDatabases() {
       }
 
       const mongoUsers = await UserModel.find({}).lean() as any[];
-      const activeMongoUsers = mongoUsers.filter(u => u.id && !deletedUserIds.includes(u.id));
-      const localUsers = dbCache.users || [];
-
-      // Sync any missing local users to MongoDB (excluding deleted ones)
-      for (const localUser of localUsers) {
-        if (!deletedUserIds.includes(localUser.id)) {
-          const hasInMongo = activeMongoUsers.some(u => (u.id || u._id?.toString()) === localUser.id);
-          if (!hasInMongo) {
-            try {
-              await UserModel.updateOne({ id: localUser.id }, { $set: localUser }, { upsert: true });
-              console.log(`Synced User ${localUser.id} from local cache to MongoDB.`);
-            } catch (uErr) {
-              console.error(`Failed to sync user ${localUser.id} to MongoDB:`, uErr);
-            }
-          }
-        }
-      }
-
-      // Pull refreshed list from MongoDB
-      const updatedMongoUsers = await UserModel.find({}).lean() as any[];
+      // Normalize all MongoDB users immediately to ensure reliable ID checks
+      const normalizedMongoUsers = mongoUsers.map((u: any) => ({
+        ...u,
+        id: u.id || u._id?.toString() || ''
+      }));
+      
+      const activeMongoUsers = normalizedMongoUsers.filter(u => u.id && !deletedUserIds.includes(u.id));
+      // MongoDB is the absolute source of truth. Discard local users that don't exist in MongoDB when MongoDB is active.
       const reconciledUsers: User[] = [];
 
-      for (const u of updatedMongoUsers) {
-        if (!deletedUserIds.includes(u.id)) {
-          reconciledUsers.push({
-            id: u.id || u._id?.toString() || '',
-            username: u.username || '',
-            email: u.email || '',
-            passwordHash: u.passwordHash || '',
-            role: u.role || 'user',
-            createdAt: u.createdAt || new Date().toISOString(),
-            phone: u.phone,
-            whatsapp: u.whatsapp,
-            address: u.address,
-            latitude: u.latitude,
-            longitude: u.longitude,
-            privacyEnabled: u.privacyEnabled !== undefined ? Boolean(u.privacyEnabled) : false
-          });
-        }
+      for (const u of activeMongoUsers) {
+        reconciledUsers.push({
+          id: u.id,
+          username: u.username || '',
+          email: u.email || '',
+          passwordHash: u.passwordHash || '',
+          role: u.role || 'user',
+          createdAt: u.createdAt || new Date().toISOString(),
+          phone: u.phone,
+          whatsapp: u.whatsapp,
+          address: u.address,
+          latitude: u.latitude,
+          longitude: u.longitude,
+          privacyEnabled: u.privacyEnabled !== undefined ? Boolean(u.privacyEnabled) : false
+        });
       }
 
-      // Non-destructive fallback merge: keep any local-only users that failed to sync and are not deleted so they are never lost
-      for (const localUser of localUsers) {
-        if (!deletedUserIds.includes(localUser.id) && !reconciledUsers.some(u => u.id === localUser.id)) {
-          reconciledUsers.push(localUser);
-        }
-      }
-
-      // Cleanup tombstone list dynamically without erasing concurrent live deletions
+      // Cleanup tombstone list dynamically without erasing concurrent live deletions using resilient queries
       if (deletedUserIds.length > 0) {
         const stillExistingUserIds = new Set<string>();
         try {
-          const existingDocs = await UserModel.find({ id: { $in: deletedUserIds } }, { id: 1 }).lean();
+          const orQueries: any[] = [{ id: { $in: deletedUserIds } }];
+          const objectIds: any[] = [];
+          for (const delId of deletedUserIds) {
+            if (delId && /^[0-9a-fA-F]{24}$/.test(delId)) {
+              try {
+                objectIds.push(new mongoose.Types.ObjectId(delId));
+              } catch (e) {}
+            }
+          }
+          if (objectIds.length > 0) {
+            orQueries.push({ _id: { $in: objectIds } });
+          }
+          const existingDocs = await UserModel.find({ $or: orQueries }, { id: 1, _id: 1 }).lean();
           existingDocs.forEach((doc: any) => {
             if (doc.id) stillExistingUserIds.add(doc.id);
+            if (doc._id) stillExistingUserIds.add(doc._id.toString());
           });
         } catch (e) {
           console.error('Error checking existing deleted users in MongoDB:', e);
@@ -1332,7 +1343,14 @@ export const DatabaseService = {
     return runMongo(
       async () => {
         const docs = await UserModel.find({}).lean();
-        return docs as unknown as User[];
+        const mongoUsers = (docs as any[]).map((mu: any) => ({
+          ...mu,
+          id: mu.id || mu._id?.toString() || ''
+        }));
+        const deletedUserIds = dbCache.deletedUserIds || [];
+        dbCache.users = mongoUsers.filter(u => u.id && !deletedUserIds.includes(u.id));
+        saveToDisk();
+        return dbCache.users;
       },
       async () => dbCache.users
     );
@@ -1341,33 +1359,48 @@ export const DatabaseService = {
   async findUserByEmail(email: string): Promise<User | undefined> {
     if (!email || typeof email !== 'string') return undefined;
     const cleanEmail = email.trim().toLowerCase();
-    const cachedUser = dbCache.users.find(u => u.email && u.email.toLowerCase() === cleanEmail);
-    if (cachedUser) {
-      return cachedUser;
-    }
+
     return runMongo(
       async () => {
-        let doc = await UserModel.findOne({ email: cleanEmail }).lean();
+        const doc = await UserModel.findOne({ email: cleanEmail }).lean();
         if (doc) {
-          const u = doc as unknown as User;
-          if (!dbCache.users.some(existing => existing.id === u.id)) {
-            dbCache.users.push(u);
-            saveToDisk();
+          const u = doc as any;
+          const resolvedId = u.id || u._id?.toString() || '';
+          const normalizedUser: User = {
+            id: resolvedId,
+            username: u.username || '',
+            email: u.email || '',
+            passwordHash: u.passwordHash || '',
+            role: u.role || 'user',
+            createdAt: u.createdAt || new Date().toISOString(),
+            phone: u.phone,
+            whatsapp: u.whatsapp,
+            address: u.address,
+            latitude: u.latitude,
+            longitude: u.longitude,
+            privacyEnabled: u.privacyEnabled !== undefined ? Boolean(u.privacyEnabled) : false
+          };
+
+          const idx = dbCache.users.findIndex(existing => existing.id === resolvedId);
+          if (idx === -1) {
+            dbCache.users.push(normalizedUser);
+          } else {
+            dbCache.users[idx] = normalizedUser;
           }
-          return u;
+          saveToDisk();
+          return normalizedUser;
         }
         return undefined;
       },
-      async () => undefined
+      async () => {
+        return dbCache.users.find(u => u.email && u.email.toLowerCase() === cleanEmail);
+      }
     );
   },
 
   async findUserByName(username: string): Promise<User | undefined> {
     if (!username || typeof username !== 'string') return undefined;
-    const cachedUser = dbCache.users.find(u => u.username.toLowerCase() === username.toLowerCase());
-    if (cachedUser) {
-      return cachedUser;
-    }
+
     return runMongo(
       async () => {
         let doc = await UserModel.findOne({ username }).lean();
@@ -1376,38 +1409,76 @@ export const DatabaseService = {
           doc = await UserModel.findOne({ username: { $regex: new RegExp(`^${escaped}$`, 'i') } }).lean();
         }
         if (doc) {
-          const u = doc as unknown as User;
-          if (!dbCache.users.some(existing => existing.id === u.id)) {
-            dbCache.users.push(u);
-            saveToDisk();
+          const u = doc as any;
+          const resolvedId = u.id || u._id?.toString() || '';
+          const normalizedUser: User = {
+            id: resolvedId,
+            username: u.username || '',
+            email: u.email || '',
+            passwordHash: u.passwordHash || '',
+            role: u.role || 'user',
+            createdAt: u.createdAt || new Date().toISOString(),
+            phone: u.phone,
+            whatsapp: u.whatsapp,
+            address: u.address,
+            latitude: u.latitude,
+            longitude: u.longitude,
+            privacyEnabled: u.privacyEnabled !== undefined ? Boolean(u.privacyEnabled) : false
+          };
+
+          const idx = dbCache.users.findIndex(existing => existing.id === resolvedId);
+          if (idx === -1) {
+            dbCache.users.push(normalizedUser);
+          } else {
+            dbCache.users[idx] = normalizedUser;
           }
-          return u;
+          saveToDisk();
+          return normalizedUser;
         }
         return undefined;
       },
-      async () => undefined
+      async () => {
+        return dbCache.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+      }
     );
   },
 
   async findUserById(id: string): Promise<User | undefined> {
-    const cachedUser = dbCache.users.find(u => u.id === id);
-    if (cachedUser) {
-      return cachedUser;
-    }
     return runMongo(
       async () => {
         const doc = await UserModel.findOne(getResilientQuery(id)).lean();
         if (doc) {
-          const u = doc as unknown as User;
-          if (!dbCache.users.some(existing => existing.id === u.id)) {
-            dbCache.users.push(u);
-            saveToDisk();
+          const u = doc as any;
+          const resolvedId = u.id || u._id?.toString() || '';
+          const normalizedUser: User = {
+            id: resolvedId,
+            username: u.username || '',
+            email: u.email || '',
+            passwordHash: u.passwordHash || '',
+            role: u.role || 'user',
+            createdAt: u.createdAt || new Date().toISOString(),
+            phone: u.phone,
+            whatsapp: u.whatsapp,
+            address: u.address,
+            latitude: u.latitude,
+            longitude: u.longitude,
+            privacyEnabled: u.privacyEnabled !== undefined ? Boolean(u.privacyEnabled) : false
+          };
+
+          const idx = dbCache.users.findIndex(existing => existing.id === resolvedId);
+          if (idx === -1) {
+            dbCache.users.push(normalizedUser);
+          } else {
+            dbCache.users[idx] = normalizedUser;
           }
-          return u;
+          saveToDisk();
+          return normalizedUser;
         }
         return undefined;
       },
-      async () => undefined
+      async () => {
+        return dbCache.users.find(u => u.id === id);
+      }
     );
   },
 
@@ -2537,22 +2608,14 @@ export const DatabaseService = {
     return runMongo(
       async () => {
         const docs = await UserModel.find({}).lean();
-        const mongoUsers = docs as unknown as User[];
+        const mongoUsers = (docs as any[]).map((mu: any) => ({
+          ...mu,
+          id: mu.id || mu._id?.toString() || ''
+        }));
         const deletedUserIds = dbCache.deletedUserIds || [];
 
-        // Prune deleted users from dbCache
-        dbCache.users = dbCache.users.filter(u => !deletedUserIds.includes(u.id));
-
-        for (const mu of mongoUsers) {
-          if (!deletedUserIds.includes(mu.id)) {
-            const cacheIdx = dbCache.users.findIndex(u => u.id === mu.id);
-            if (cacheIdx === -1) {
-              dbCache.users.push(mu);
-            } else {
-              dbCache.users[cacheIdx] = { ...dbCache.users[cacheIdx], ...mu };
-            }
-          }
-        }
+        // Rely on MongoDB completely as the source of truth, filtering out deleted ones
+        dbCache.users = mongoUsers.filter(mu => mu.id && !deletedUserIds.includes(mu.id));
         saveToDisk();
         return dbCache.users;
       },
@@ -2586,7 +2649,8 @@ export const DatabaseService = {
 
     await runMongo(
       async () => {
-        await UserModel.deleteOne({ id: userId });
+        await UserModel.deleteMany(getResilientQuery(userId));
+        await UserModel.collection.deleteMany({ id: userId });
       },
       async () => {}
     );
