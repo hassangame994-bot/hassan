@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Remix: Remix: Remix: Remix: Remix:  مطعم أبو قورة - Abu Qura Restaurant المعدل",
+  "description": "الموقع الرسمي لمطعم أبو قورة، لطلب أشهى المأكولات والمشاوي الفاخرة مع نظام تتبع الطلبات المباشر ولوحة تحكم ذكية للمدير.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
